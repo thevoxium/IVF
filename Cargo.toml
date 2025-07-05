@@ -1,0 +1,9 @@
+[package]
+name = "simple-ivf-kentro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kentro = "0.1.0"
+ndarray = "0.16"
+rand = "0.8"

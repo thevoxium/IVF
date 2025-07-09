@@ -7,7 +7,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::time::Instant;
 
 struct Ivf {
@@ -101,8 +101,6 @@ impl Ivf {
                 .sum_all()?
                 .to_scalar::<f32>()?;
             centroids = new_centroids;
-
-            println!("K-means iteration {}: change = {:.6}", iteration, diff);
 
             if diff < 1e-6 {
                 break;
@@ -268,7 +266,8 @@ impl Ivf {
             .map(|(idx, _)| idx)
             .collect();
 
-        let mut heap: BinaryHeap<Reverse<(NotNan<f32>, usize)>> = BinaryHeap::new();
+        // FIXED: Use max-heap like linear search
+        let mut heap: BinaryHeap<(NotNan<f32>, usize)> = BinaryHeap::new();
 
         for cluster_id in selected_clusters {
             if let Some(point_indices) = self.clusters.get(cluster_id) {
@@ -278,11 +277,12 @@ impl Ivf {
                     let distance_ordered = NotNan::new(distance).unwrap();
 
                     if heap.len() < top_k {
-                        heap.push(Reverse((distance_ordered, point_idx)));
-                    } else if let Some(Reverse((worst_distance, _))) = heap.peek() {
+                        heap.push((distance_ordered, point_idx)); // Removed Reverse
+                    } else if let Some((worst_distance, _)) = heap.peek() {
+                        // Removed Reverse
                         if distance_ordered < *worst_distance {
                             heap.pop();
-                            heap.push(Reverse((distance_ordered, point_idx)));
+                            heap.push((distance_ordered, point_idx)); // Removed Reverse
                         }
                     }
                 }
@@ -291,7 +291,7 @@ impl Ivf {
 
         let mut results: Vec<(usize, f32)> = heap
             .into_iter()
-            .map(|Reverse((distance, doc_id))| (doc_id, distance.into_inner()))
+            .map(|(distance, doc_id)| (doc_id, distance.into_inner())) // Removed Reverse
             .collect();
 
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -312,13 +312,67 @@ fn normalize_dataset(data: &mut Array2<f32>) {
 
 fn load_npy_file(path: &str) -> anyhow::Result<Array2<f32>> {
     let array: Array2<f32> = read_npy(path)?;
-    println!("Loaded array with shape: {:?}", array.shape(),);
     Ok(array)
 }
 
-fn main() -> anyhow::Result<()> {
-    let total_start = Instant::now();
+//fn linear_search(
+//    query: &ArrayView1<f32>,
+//    embeddings: &Array2<f32>,
+//    top_k: usize,
+//) -> Vec<(usize, f32)> {
+//    let mut all_distances: Vec<(usize, f32)> = embeddings
+//        .outer_iter()
+//        .enumerate()
+//        .map(|(idx, vector_row)| {
+//            let distance = 1.0 - query.dot(&vector_row);
+//            (idx, distance)
+//        })
+//        .collect();
+//
+//    all_distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+//    all_distances.truncate(top_k);
+//    all_distances
+//}
+//
+fn linear_search(
+    query: &ArrayView1<f32>,
+    embeddings: &Array2<f32>,
+    top_k: usize,
+) -> Vec<(usize, f32)> {
+    let mut heap: BinaryHeap<(NotNan<f32>, usize)> = BinaryHeap::new();
+    for (idx, vector_row) in embeddings.outer_iter().enumerate() {
+        let distance = 1.0 - query.dot(&vector_row);
+        let distance_ordered = NotNan::new(distance).unwrap();
 
+        if heap.len() < top_k {
+            heap.push((distance_ordered, idx));
+        } else if let Some((worst_distance, _)) = heap.peek() {
+            if distance_ordered < *worst_distance {
+                heap.pop();
+                heap.push((distance_ordered, idx)); // Remove Reverse
+            }
+        }
+    }
+
+    let mut results: Vec<(usize, f32)> = heap
+        .into_iter()
+        .map(|(distance, doc_id)| (doc_id, distance.into_inner()))
+        .collect();
+
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    results
+}
+
+fn calculate_accuracy(ivf_results: &[(usize, f32)], linear_results: &[(usize, f32)]) -> f32 {
+    let linear_ids: HashSet<usize> = linear_results.iter().map(|(id, _)| *id).collect();
+    let matches = ivf_results
+        .iter()
+        .filter(|(id, _)| linear_ids.contains(id))
+        .count();
+    (matches as f32 / ivf_results.len() as f32) * 100.0
+}
+
+fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
 
     let embeddings_full = load_npy_file("index_ivf/embeddings_chunk_0.npy")?;
@@ -331,7 +385,7 @@ fn main() -> anyhow::Result<()> {
     normalize_dataset(&mut queries);
 
     let num_centroids = 1000;
-    let num_probes = 5;
+    let num_probes = 100;
     let sample_size = 50000;
     let max_iterations = 25;
 
@@ -339,65 +393,42 @@ fn main() -> anyhow::Result<()> {
     ivf.build(&embeddings, num_centroids, sample_size, max_iterations)?;
 
     let top_k = 5;
-    let mut total_query_time = 0.0;
-    let mut successful_queries = 0;
+    let mut total_accuracy = 0.0;
 
-    for i in 0..num_queries.min(100) {
+    for i in 0..num_queries {
         let query = queries.row(i);
-        let query_start = Instant::now();
 
-        match ivf.search(&query, top_k, num_probes) {
-            Ok(results) => {
-                let query_time = query_start.elapsed();
-                total_query_time += query_time.as_secs_f64();
-                successful_queries += 1;
+        let ivf_results = ivf.search(&query, top_k, num_probes)?;
+        let linear_results = linear_search(&query, &embeddings, top_k);
 
-                if i < 5 {
-                    println!(
-                        "Query {}: found {} results in {:.4} ms",
-                        i,
-                        results.len(),
-                        query_time.as_secs_f64() * 1000.0
-                    );
+        let accuracy = calculate_accuracy(&ivf_results, &linear_results);
+        total_accuracy += accuracy;
 
-                    for (rank, (doc_id, dist)) in results.iter().take(5).enumerate() {
-                        let similarity = 1.0 - dist;
-                        println!(
-                            "  {}. Document {}: similarity = {:.6}",
-                            rank + 1,
-                            doc_id,
-                            similarity
-                        );
-                    }
-                }
+        println!("Query {}:", i);
+        print!("IVF top-10: ");
+        for (j, (id, _)) in ivf_results.iter().enumerate() {
+            if j > 0 {
+                print!(", ");
             }
-            Err(e) => {
-                println!("Query {} failed: {}", i, e);
-            }
+            print!("{}", id);
         }
+        println!();
 
-        let current_avg = (total_query_time / (i + 1) as f64) * 1000.0;
-        println!(
-            "Processed {}/{} queries... Current avg: {:.2}ms",
-            i + 1,
-            num_queries.min(100),
-            current_avg
-        );
+        print!("Linear top-10: ");
+        for (j, (id, _)) in linear_results.iter().enumerate() {
+            if j > 0 {
+                print!(", ");
+            }
+            print!("{}", id);
+        }
+        println!();
+
+        println!("Accuracy: {:.2}%", accuracy);
+        println!();
     }
 
-    if successful_queries > 0 {
-        let avg_latency_ms = (total_query_time / successful_queries as f64) * 1000.0;
-        println!(
-            "Total runtime: {:.2} seconds",
-            total_start.elapsed().as_secs_f64()
-        );
-        println!("Total queries processed: {}", successful_queries);
-        println!("Average latency per query: {:.4} ms", avg_latency_ms);
-        println!(
-            "Queries per second: {:.2}",
-            successful_queries as f64 / total_query_time
-        );
-    }
+    let average_accuracy = total_accuracy / num_queries as f32;
+    println!("Overall Average Accuracy: {:.2}%", average_accuracy);
 
     Ok(())
 }
